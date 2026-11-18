@@ -1,34 +1,353 @@
-
-
-import streamlit as st
-import cv2
 import csv
-import tempfile
 import subprocess
-import imageio_ffmpeg
-
+import tempfile
 from pathlib import Path
+
+import cv2
+import numpy as np
+import imageio_ffmpeg
+import streamlit as st
+
 from utils.player_tracker import FootballTracker
-from utils.heatmap import FootballHeatmap
 
 
 # ============================================================
-# PATHS
+# PROJECT PATHS
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+INPUT_DIR = PROJECT_DIR / "input_videos"
+OUTPUT_DIR = PROJECT_DIR / "output_videos"
+DATA_DIR = PROJECT_DIR / "output_data"
 
-OUTPUT_VIDEO_DIR = BASE_DIR / "output_videos"
-OUTPUT_DATA_DIR = BASE_DIR / "output_data"
-
-OUTPUT_VIDEO_DIR.mkdir(exist_ok=True)
-OUTPUT_DATA_DIR.mkdir(exist_ok=True)
-
-OUTPUT_VIDEO = OUTPUT_VIDEO_DIR / "football_analysis.mp4"
-OUTPUT_CSV = OUTPUT_DATA_DIR / "tracking_data.csv"
+INPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
-# STREAMLIT CONFIG
+# OUTPUT PATHS
+# ============================================================
+
+ANNOTATED_RAW = OUTPUT_DIR / "football_analysis_raw.mp4"
+ANNOTATED_VIDEO = OUTPUT_DIR / "football_analysis.mp4"
+
+COMBINED_OVERLAY_RAW = OUTPUT_DIR / "combined_overlay_raw.mp4"
+TEAM_A_OVERLAY_RAW = OUTPUT_DIR / "team_a_overlay_raw.mp4"
+TEAM_B_OVERLAY_RAW = OUTPUT_DIR / "team_b_overlay_raw.mp4"
+
+COMBINED_OVERLAY = OUTPUT_DIR / "combined_heatmap_overlay.mp4"
+TEAM_A_OVERLAY = OUTPUT_DIR / "team_a_heatmap_overlay.mp4"
+TEAM_B_OVERLAY = OUTPUT_DIR / "team_b_heatmap_overlay.mp4"
+
+CSV_PATH = DATA_DIR / "tracking_data.csv"
+
+
+# ============================================================
+# DETECTION HELPERS
+# ============================================================
+
+def get_value(detection, *keys, default=None):
+    for key in keys:
+        if isinstance(detection, dict) and key in detection:
+            value = detection[key]
+            if value is not None:
+                return value
+        elif hasattr(detection, key):
+            value = getattr(detection, key)
+            if value is not None:
+                return value
+    return default
+
+
+def get_detection_type(detection):
+    value = get_value(
+        detection, "object_type", "class_name", "class", "label", "name",
+        default="other"
+    )
+    return str(value).strip().lower()
+
+
+def classify_detection(object_type):
+    name = str(object_type).lower()
+    if "goalkeeper" in name or "keeper" in name:
+        return "goalkeeper"
+    if "referee" in name or "official" in name:
+        return "referee"
+    if "ball" in name:
+        return "ball"
+    if "player" in name or "person" in name:
+        return "player"
+    return "other"
+
+
+def get_bbox(detection):
+    bbox = get_value(detection, "bbox", "xyxy", "box", default=None)
+    if bbox is None:
+        return None
+    try:
+        if hasattr(bbox, "tolist"):
+            bbox = bbox.tolist()
+        if len(bbox) == 1 and hasattr(bbox[0], "__len__"):
+            bbox = bbox[0]
+        if len(bbox) < 4:
+            return None
+        return tuple(int(float(v)) for v in bbox[:4])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def get_team(detection):
+    return get_value(detection, "team", "team_name", default="")
+
+
+def normalize_team(team):
+    if team is None:
+        return None
+    value = str(team).strip().lower()
+    if value in ("0", "a", "team a", "team_a"):
+        return 0
+    if value in ("1", "b", "team b", "team_b"):
+        return 1
+    return None
+
+
+# ============================================================
+# HEATMAP OVERLAY HELPERS (ORIGINAL MATCH VIDEO)
+# ============================================================
+
+def add_heat_point(heat, x, y, radius=24, strength=0.30):
+    height, width = heat.shape
+    x, y = int(x), int(y)
+    if 0 <= x < width and 0 <= y < height:
+        cv2.circle(heat, (x, y), radius, strength, -1)
+
+
+def create_heat_overlay(frame, heat, opacity=0.50):
+    if heat.max() <= 0:
+        return frame
+
+    blurred = cv2.GaussianBlur(heat, (0, 0), sigmaX=28, sigmaY=28)
+    normalized = blurred / max(float(blurred.max()), 1e-6)
+    normalized = np.clip(normalized, 0, 1)
+    heat_uint8 = (normalized * 255).astype(np.uint8)
+    colored = cv2.applyColorMap(heat_uint8, cv2.COLORMAP_JET)
+    mask = heat_uint8 > 18
+
+    result = frame.copy()
+    if np.any(mask):
+        result[mask] = cv2.addWeighted(
+            frame[mask], 1.0 - opacity, colored[mask], opacity, 0
+        )
+    return result
+
+
+def write_overlay_frame(
+    frame, combined_heat, team_a_heat, team_b_heat,
+    combined_writer, team_a_writer, team_b_writer
+):
+    combined_writer.write(create_heat_overlay(frame, combined_heat))
+    team_a_writer.write(create_heat_overlay(frame, team_a_heat))
+    team_b_writer.write(create_heat_overlay(frame, team_b_heat))
+
+
+# ============================================================
+# VIDEO CONVERSION FOR STREAMLIT
+# ============================================================
+
+def convert_to_h264(input_path, output_path):
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    command = [
+        ffmpeg, "-y", "-i", str(input_path),
+        "-c:v", "libx264", "-preset", "fast",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-an", str(output_path)
+    ]
+    result = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError("FFmpeg conversion failed:\n" + result.stderr[-2500:])
+    return output_path
+
+
+# ============================================================
+# FOOTBALL VIDEO ANALYSIS
+# ============================================================
+
+def analyze_video(video_path, confidence):
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open input video.")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        fps = 30.0
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise RuntimeError("Invalid video dimensions.")
+
+    size = (width, height)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    annotated_writer = cv2.VideoWriter(str(ANNOTATED_RAW), fourcc, fps, size)
+    combined_writer = cv2.VideoWriter(str(COMBINED_OVERLAY_RAW), fourcc, fps, size)
+    team_a_writer = cv2.VideoWriter(str(TEAM_A_OVERLAY_RAW), fourcc, fps, size)
+    team_b_writer = cv2.VideoWriter(str(TEAM_B_OVERLAY_RAW), fourcc, fps, size)
+
+    writers = [annotated_writer, combined_writer, team_a_writer, team_b_writer]
+    if not all(writer.isOpened() for writer in writers):
+        cap.release()
+        for writer in writers:
+            writer.release()
+        raise RuntimeError("Failed to initialize one or more video writers.")
+
+    tracker = FootballTracker()
+
+    # Heat buffers use original video resolution.
+    combined_heat = np.zeros((height, width), dtype=np.float32)
+    team_a_heat = np.zeros((height, width), dtype=np.float32)
+    team_b_heat = np.zeros((height, width), dtype=np.float32)
+
+    csv_rows = []
+    player_detections = 0
+    referee_detections = 0
+    goalkeeper_detections = 0
+    ball_detections = 0
+    team_a_track_ids = set()
+    team_b_track_ids = set()
+    frame_number = 0
+
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    try:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
+            frame_number += 1
+
+            detections = tracker.track(frame, confidence=confidence)
+            if detections is None:
+                detections = []
+
+            annotated_frame = tracker.draw_detections(frame.copy(), detections)
+
+            for detection in detections:
+                object_type = get_detection_type(detection)
+                category = classify_detection(object_type)
+                bbox = get_bbox(detection)
+                team = get_team(detection)
+                team_id = normalize_team(team)
+
+                track_id = get_value(
+                    detection, "track_id", "tracker_id", "id", default=None
+                )
+                confidence_value = get_value(
+                    detection, "confidence", "conf", default=""
+                )
+
+                if category == "player":
+                    player_detections += 1
+                elif category == "referee":
+                    referee_detections += 1
+                elif category == "goalkeeper":
+                    goalkeeper_detections += 1
+                elif category == "ball":
+                    ball_detections += 1
+
+                if bbox is None:
+                    continue
+
+                x1, y1, x2, y2 = bbox
+
+                if track_id is not None:
+                    if category == "player" and team_id == 0:
+                        team_a_track_ids.add(track_id)
+                    elif category == "player" and team_id == 1:
+                        team_b_track_ids.add(track_id)
+
+                csv_rows.append({
+                    "frame": frame_number,
+                    "track_id": track_id,
+                    "object_type": object_type,
+                    "team": team,
+                    "confidence": confidence_value,
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                })
+
+                # Heatmaps are based on player foot point (bottom-center).
+                if category != "player":
+                    continue
+
+                player_x = max(0, min(width - 1, (x1 + x2) // 2))
+                player_y = max(0, min(height - 1, y2))
+
+                add_heat_point(combined_heat, player_x, player_y)
+                if team_id == 0:
+                    add_heat_point(team_a_heat, player_x, player_y)
+                elif team_id == 1:
+                    add_heat_point(team_b_heat, player_x, player_y)
+
+            # Write the source frame, annotations, and three heatmap overlays.
+            annotated_writer.write(annotated_frame)
+            write_overlay_frame(
+                frame, combined_heat, team_a_heat, team_b_heat,
+                combined_writer, team_a_writer, team_b_writer
+            )
+
+            if total_frames > 0:
+                progress.progress(min(frame_number / total_frames, 1.0))
+            status.text(f"Processing frame {frame_number} / {total_frames or '?'}")
+
+    finally:
+        cap.release()
+        for writer in writers:
+            writer.release()
+
+    progress.progress(1.0)
+    status.success("Football tracking completed.")
+
+    # Save tracking CSV.
+    fieldnames = [
+        "frame", "track_id", "object_type", "team", "confidence",
+        "x1", "y1", "x2", "y2"
+    ]
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as file:
+        csv_writer = csv.DictWriter(file, fieldnames=fieldnames)
+        csv_writer.writeheader()
+        csv_writer.writerows(csv_rows)
+
+    # Convert videos to browser-friendly H.264.
+    status.info("Converting videos for browser playback...")
+    convert_to_h264(ANNOTATED_RAW, ANNOTATED_VIDEO)
+    convert_to_h264(COMBINED_OVERLAY_RAW, COMBINED_OVERLAY)
+    convert_to_h264(TEAM_A_OVERLAY_RAW, TEAM_A_OVERLAY)
+    convert_to_h264(TEAM_B_OVERLAY_RAW, TEAM_B_OVERLAY)
+    status.success("All four videos converted successfully.")
+
+    return {
+        "annotated": str(ANNOTATED_VIDEO),
+        "combined_overlay": str(COMBINED_OVERLAY),
+        "team_a_overlay": str(TEAM_A_OVERLAY),
+        "team_b_overlay": str(TEAM_B_OVERLAY),
+        "csv": str(CSV_PATH),
+        "frames": frame_number,
+        "players": player_detections,
+        "referees": referee_detections,
+        "goalkeepers": goalkeeper_detections,
+        "balls": ball_detections,
+        "team_a_count": len(team_a_track_ids),
+        "team_b_count": len(team_b_track_ids),
+    }
+
+
+# ============================================================
+# STREAMLIT UI
 # ============================================================
 
 st.set_page_config(
@@ -38,459 +357,138 @@ st.set_page_config(
 )
 
 st.title("⚽ AI Football Video Analysis System")
-
-st.markdown(
-    "Upload a football video to detect players, "
-    "track movement, identify teams and generate heatmaps."
+st.write(
+    "Upload football footage to detect and track players, identify teams, "
+    "and generate heatmap overlays on the match video."
 )
-
-# ============================================================
-# SIDEBAR
-# ============================================================
 
 st.sidebar.header("Analysis Settings")
-
 confidence = st.sidebar.slider(
-    "Detection Confidence",
-    min_value=0.10,
-    max_value=0.90,
-    value=0.30,
-    step=0.05
+    "Detection Confidence", min_value=0.10, max_value=0.90,
+    value=0.30, step=0.05
 )
 
-# ============================================================
-# VIDEO UPLOAD
-# ============================================================
-
 uploaded_video = st.file_uploader(
-    "Upload Football Video",
-    type=["mp4", "avi", "mov", "mkv"]
+    "Upload Football Video", type=["mp4", "avi", "mov", "mkv"]
 )
 
 if uploaded_video is not None:
-
     st.video(uploaded_video)
 
     if st.button("Start Football Analysis", type="primary"):
+        temp_video_path = None
+        try:
+            suffix = Path(uploaded_video.name).suffix or ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(uploaded_video.getbuffer())
+                temp_video_path = temp_file.name
 
-        # Save uploaded video temporarily
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".mp4"
-        ) as temp_file:
+            with st.spinner("Detecting and tracking players, generating heatmaps..."):
+                results = analyze_video(temp_video_path, confidence)
 
-            temp_file.write(uploaded_video.getbuffer())
-            input_video_path = temp_file.name
+            st.session_state["football_results"] = results
+            st.success("Football analysis finished!")
 
-        cap = cv2.VideoCapture(input_video_path)
+        except Exception as error:
+            st.error("Analysis failed.")
+            st.exception(error)
 
-        if not cap.isOpened():
-            st.error("Unable to open uploaded video.")
-            st.stop()
+        finally:
+            if temp_video_path and Path(temp_video_path).exists():
+                try:
+                    Path(temp_video_path).unlink()
+                except OSError:
+                    pass
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-
-        if fps <= 0:
-            fps = 30
-
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        st.info(
-            f"Video: {width} × {height} | "
-            f"FPS: {fps:.2f} | Frames: {total_frames}"
-        )
-
-        # ====================================================
-        # INITIALIZE TRACKER
-        # ====================================================
-
-        tracker = FootballTracker()
-
-        # ====================================================
-        # INITIALIZE HEATMAPS
-        # ====================================================
-
-        combined_heatmap = FootballHeatmap()
-        team_a_heatmap = FootballHeatmap()
-        team_b_heatmap = FootballHeatmap()
-
-        # ====================================================
-        # VIDEO WRITER
-        # ====================================================
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
-        writer = cv2.VideoWriter(
-            str(OUTPUT_VIDEO),
-            fourcc,
-            fps,
-            (width, height)
-        )
-
-        # ====================================================
-        # CSV
-        # ====================================================
-
-        csv_rows = []
-
-        # ====================================================
-        # ANALYSIS COUNTERS
-        # ====================================================
-
-        frame_count = 0
-        player_count = 0
-        referee_count = 0
-        goalkeeper_count = 0
-        ball_count = 0
-
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        # ====================================================
-        # PROCESS VIDEO
-        # ====================================================
-
-        while True:
-
-            ret, frame = cap.read()
-
-            if not ret:
-                break
-
-            frame_count += 1
-
-            detections = tracker.track(
-                frame,
-                confidence=confidence
-            )
-
-            annotated_frame = tracker.draw_detections(
-                frame.copy(),
-                detections
-            )
-
-            # -----------------------------------------------
-            # PROCESS DETECTIONS
-            # -----------------------------------------------
-
-            # ================= PLAYER HEATMAP TRACKING =================
-
-for detection in detections:
-
-    bbox = detection.get("bbox")
-    object_type = detection.get("object_type", "")
-    team = detection.get("team", "")
-
-    if bbox is None:
-        continue
-
-    # Player positions only
-    if str(object_type).lower() != "player":
-        continue
-
-    x1, y1, x2, y2 = map(int, bbox)
-
-    # Player foot position
-    player_x = (x1 + x2) // 2
-    player_y = y2
-
-    # Save player position for heatmap
-    combined_heatmap.add_position(
-        player_x,
-        player_y,
-        frame.shape[1],
-        frame.shape[0]
-    )
-
-    # Team A
-    if str(team).lower() in ["team a", "team_a", "a", "0"]:
-        team_a_heatmap.add_position(
-            player_x,
-            player_y,
-            frame.shape[1],
-            frame.shape[0]
-        )
-
-    # Team B
-    elif str(team).lower() in ["team b", "team_b", "b", "1"]:
-        team_b_heatmap.add_position(
-            player_x,
-            player_y,
-            frame.shape[1],
-            frame.shape[0]
-        )
-                # -------------------------------------------
-                # CSV ROW
-                # -------------------------------------------
-
-                csv_rows.append({
-                    "frame": frame_count,
-                    "track_id": track_id,
-                    "object_type": object_type,
-                    "team": team,
-                    "confidence": detection.get("confidence"),
-                    "x1": x1,
-                    "y1": y1,
-                    "x2": x2,
-                    "y2": y2
-                })
-
-            # -----------------------------------------------
-            # WRITE COMPLETE ANNOTATED FRAME
-            # -----------------------------------------------
-
-            writer.write(annotated_frame)
-
-            # -----------------------------------------------
-            # PROGRESS
-            # -----------------------------------------------
-
-            if total_frames > 0:
-
-                progress = min(
-                    frame_count / total_frames,
-                    1.0
-                )
-
-                progress_bar.progress(progress)
-
-                status_text.text(
-                    f"Processing frame "
-                    f"{frame_count}/{total_frames}"
-                )
-
-        # ====================================================
-        # RELEASE VIDEO
-        # ====================================================
-
-        cap.release()
-        writer.release()
-
-        progress_bar.progress(1.0)
-        status_text.success("Football video analysis completed!")
-
-        # ====================================================
-        # SAVE TRACKING CSV
-        # ====================================================
-
-        with open(
-            OUTPUT_CSV,
-            "w",
-            newline="",
-            encoding="utf-8"
-        ) as csv_file:
-
-            fieldnames = [
-                "frame",
-                "track_id",
-                "object_type",
-                "team",
-                "confidence",
-                "x1",
-                "y1",
-                "x2",
-                "y2"
-            ]
-
-            csv_writer = csv.DictWriter(
-                csv_file,
-                fieldnames=fieldnames
-            )
-
-            csv_writer.writeheader()
-            csv_writer.writerows(csv_rows)
-
-        # ====================================================
-        # GENERATE HEATMAPS
-        # ====================================================
-
-        combined_path = combined_heatmap.generate_heatmap(
-            str(OUTPUT_VIDEO_DIR / "combined_heatmap.png")
-        )
-
-        team_a_path = team_a_heatmap.generate_heatmap(
-            str(OUTPUT_VIDEO_DIR / "team_a_heatmap.png")
-        )
-
-        team_b_path = team_b_heatmap.generate_heatmap(
-            str(OUTPUT_VIDEO_DIR / "team_b_heatmap.png")
-        )
-
-        # ====================================================
-        # SAVE SESSION RESULTS
-        # ====================================================
-
-        st.session_state["football_results"] = {
-            "video": str(OUTPUT_VIDEO),
-            "csv": str(OUTPUT_CSV),
-            "combined": combined_path,
-            "team_a": team_a_path,
-            "team_b": team_b_path,
-            "frames": frame_count,
-            "players": player_count,
-            "referees": referee_count,
-            "goalkeepers": goalkeeper_count,
-            "balls": ball_count
-        }
 
 # ============================================================
-# DISPLAY RESULTS
+# RESULTS DISPLAY
 # ============================================================
 
 if "football_results" in st.session_state:
-
     results = st.session_state["football_results"]
 
     st.divider()
-    st.header("📊 Football Analysis Results")
+    st.header("📊 Analysis Results")
 
-    # --------------------------------------------------------
-    # METRICS
-    # --------------------------------------------------------
+    m1, m2, m3, m4, m5 = st.columns(5
+    )
+    m1.metric("Frames", results["frames"])
+    m2.metric("Player Detections", results["players"])
+    m3.metric("Referee Detections", results["referees"])
+    m4.metric("Goalkeeper Detections", results["goalkeepers"])
+    m5.metric("Ball Detections", results["balls"])
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    col1.metric("Frames", results["frames"])
-    col2.metric("Player Detections", results["players"])
-    col3.metric("Referees", results["referees"])
-    col4.metric("Goalkeepers", results["goalkeepers"])
-    col5.metric("Ball Detections", results["balls"])
-
-    # --------------------------------------------------------
-    # ANNOTATED VIDEO
-    # --------------------------------------------------------
-
-    st.subheader("🎥 Complete Annotated Football Video")
-
-    video_path = Path(results["video"])
-
-    if video_path.exists():
-
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-
-        converted_video = OUTPUT_VIDEO_DIR / "football_analysis_h264.mp4"
-
-        command = [
-            ffmpeg_exe,
-            "-y",
-            "-i", str(video_path),
-            "-vcodec", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-an",
-            str(converted_video)
-        ]
-
-        with st.spinner("Preparing video playback..."):
-
-            subprocess.run(
-                command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True
-            )
-
-        if converted_video.exists():
-
-            st.video(
-                converted_video.read_bytes(),
-                format="video/mp4"
-            )
-
-    # --------------------------------------------------------
-    # CSV DOWNLOAD
-    # --------------------------------------------------------
-
-    st.subheader("📁 Tracking Data")
-
-    csv_path = Path(results["csv"])
-
-    if csv_path.exists():
-
-        csv_bytes = csv_path.read_bytes()
-
+    # Annotated video
+    st.subheader("🎥 Annotated Football Video")
+    annotated_path = Path(results["annotated"])
+    if annotated_path.exists():
+        annotated_bytes = annotated_path.read_bytes()
+        st.video(annotated_bytes, format="video/mp4")
         st.download_button(
-            "Download Tracking CSV",
-            data=csv_bytes,
-            file_name="football_tracking_data.csv",
-            mime="text/csv"
+            "Download Annotated Video", data=annotated_bytes,
+            file_name="football_analysis.mp4", mime="video/mp4",
+            key="download_annotated"
         )
 
-        with open(
-            csv_path,
-            "r",
-            encoding="utf-8"
-        ) as csv_file:
-
-            preview_rows = list(
-                csv.DictReader(csv_file)
-            )[:10]
-
-        st.write("Tracking Data Preview")
-
-        for row in preview_rows:
-            st.text(str(row))
-
-    # --------------------------------------------------------
-    # FOOTBALL HEATMAPS
-    # --------------------------------------------------------
-
+    # Heatmap overlays on actual match footage
     st.divider()
-    st.header("🔥 Football Pitch Heatmaps")
-
-    st.info(
-        "Heatmaps show approximate player movement density. "
-        "Accurate pitch coordinates require camera calibration."
+    st.header("🔥 Heatmap Overlay on Actual Football Video")
+    st.caption(
+        "Original match footage with cumulative player-position heat "
+        "overlays. Combined includes all detected players; Team A and "
+        "Team B use the tracker team assignments."
     )
 
-    heatmap_col1, heatmap_col2, heatmap_col3 = st.columns(3)
-
-    heatmaps = [
-        (
-            "Combined Player Heatmap",
-            results["combined"],
-            "combined_heatmap.png"
-        ),
-        (
-            "Team A Heatmap",
-            results["team_a"],
-            "team_a_heatmap.png"
-        ),
-        (
-            "Team B Heatmap",
-            results["team_b"],
-            "team_b_heatmap.png"
+    combined_path = Path(results["combined_overlay"])
+    if combined_path.exists():
+        st.subheader("Combined Player Heatmap Overlay")
+        combined_bytes = combined_path.read_bytes()
+        st.video(combined_bytes, format="video/mp4")
+        st.download_button(
+            "Download Combined Heatmap Overlay", data=combined_bytes,
+            file_name="combined_heatmap_overlay.mp4", mime="video/mp4",
+            key="download_combined_overlay"
         )
-    ]
 
-    for column, heatmap in zip(
-        [heatmap_col1, heatmap_col2, heatmap_col3],
-        heatmaps
-    ):
+    col_a, col_b = st.columns(2)
 
-        title, image_path, download_name = heatmap
+    with col_a:
+        st.subheader("Team A Heatmap Overlay")
+        path_a = Path(results["team_a_overlay"])
+        if path_a.exists():
+            bytes_a = path_a.read_bytes()
+            st.video(bytes_a, format="video/mp4")
+            st.download_button(
+                "Download Team A Overlay", data=bytes_a,
+                file_name="team_a_heatmap_overlay.mp4", mime="video/mp4",
+                key="download_team_a_overlay"
+            )
+        else:
+            st.warning(f"Video not found: {path_a.name}")
 
-        with column:
+    with col_b:
+        st.subheader("Team B Heatmap Overlay")
+        path_b = Path(results["team_b_overlay"])
+        if path_b.exists():
+            bytes_b = path_b.read_bytes()
+            st.video(bytes_b, format="video/mp4")
+            st.download_button(
+                "Download Team B Overlay", data=bytes_b,
+                file_name="team_b_heatmap_overlay.mp4", mime="video/mp4",
+                key="download_team_b_overlay"
+            )
+        else:
+            st.warning(f"Video not found: {path_b.name}")
 
-            st.subheader(title)
-
-            image_file = Path(image_path)
-
-            if image_file.exists():
-
-                image_bytes = image_file.read_bytes()
-
-                st.image(
-                    image_bytes,
-                    use_container_width=True
-                )
-
-                st.download_button(
-                    f"Download {title}",
-                    data=image_bytes,
-                    file_name=download_name,
-                    mime="image/png",
-                    key=download_name
-                )
+    # CSV download only. No dataframe or CSV preview (avoids pyarrow dependency).
+    st.divider()
+    st.header("📄 Tracking Data")
+    csv_path = Path(results["csv"])
+    if csv_path.exists():
+        csv_bytes = csv_path.read_bytes()
+        st.download_button(
+            "Download Tracking CSV", data=csv_bytes,
+            file_name="tracking_data.csv", mime="text/csv",
+            key="download_tracking_csv"
+        )
